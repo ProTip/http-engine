@@ -1,25 +1,31 @@
 // checkengine project main.go
-package main
+package httpengine
 
 import (
-	"bytes"
-	"dripper"
 	"fmt"
-	"io/ioutil"
+	"github.com/amir/raidman"
+	"github.com/protip/dripper"
 	"net"
 	"net/http"
-	"runtime"
+	"strconv"
 	"sync"
 	"time"
 )
 
 type HttpCheck struct {
-	Url      string
+	Address  string
+	Host     string
+	Path     string
 	Interval int // How often we should check
 	Timeout  int // Timeout in seconds applied as a hard IO deadline
 }
 
+type HttpEngine struct {
+	dripper *dripper.Dripper
+}
+
 type CheckStatus struct {
+	Check        *HttpCheck
 	Message      string
 	ResponseTime time.Duration
 }
@@ -27,38 +33,45 @@ type CheckStatus struct {
 var wg sync.WaitGroup
 var timeout = time.Duration(6 * time.Second)
 
-func main() {
-	runtime.GOMAXPROCS(1)
-
-	var codes = make(chan *CheckStatus, 50)
-	d := dripper.NewDripper()
-	urlsBytes, err := ioutil.ReadFile("urls.txt")
-	_ = err
-	urlsBytes = urlsBytes[:len(urlsBytes)-1]
-	urls := bytes.Split(urlsBytes, []byte("\n"))
-	for _, url := range urls {
-		d.AddDrop(string(url), 0)
+func NewHttpEngine() *HttpEngine {
+	return &HttpEngine{
+		dripper: dripper.NewDripper(),
 	}
-	d.Drip()
-	wg.Add(1)
-	go collectDrops(d.Faucet, codes)
-	go printStatus(codes)
-	wg.Wait()
+}
+
+func (e *HttpEngine) AddCheck() {
+
 }
 
 func printStatus(c chan *CheckStatus) {
 	for {
-		fmt.Println(<-c)
+		status := <-c
+		fmt.Print(status.Check.Host)
+		fmt.Println(status)
+
+		c, err := raidman.Dial("tcp", "localhost:5555")
+		if err != nil {
+			panic(err)
+		}
+
+		var event = &raidman.Event{
+			State:   status.Message,
+			Host:    status.Check.Host,
+			Service: "http",
+			Metric:  status.ResponseTime.Seconds() * 1000,
+		}
+
+		err = c.Send(event)
+		if err != nil {
+			panic(err)
+		}
 	}
 }
 
 func collectDrops(faucet chan interface{}, codes chan *CheckStatus) {
 	for {
-		key := <-faucet
-		check := &HttpCheck{
-			Url: key.(string),
-		}
-		go checkStatus(check, codes)
+		check := <-faucet
+		go checkStatus(check.(*HttpCheck), codes)
 	}
 }
 
@@ -70,7 +83,7 @@ func checkStatus(check *HttpCheck, codes chan *CheckStatus) {
 
 	transport := http.Transport{
 		Dial: func(network, addr string) (net.Conn, error) {
-			con, err := net.DialTimeout(network, addr, timeout)
+			con, err := net.DialTimeout(network, check.Address, timeout)
 			if err != nil {
 				return nil, err
 			}
@@ -84,17 +97,17 @@ func checkStatus(check *HttpCheck, codes chan *CheckStatus) {
 	}
 
 	start := time.Now()
-	resp, err := client.Head(check.Url)
+	resp, err := client.Head("http://" + check.Host + check.Path)
 	if err == nil {
 		end := time.Now()
 		responseTime := end.Sub(start)
-		httpStatus := &CheckStatus{resp.Status, responseTime}
+		httpStatus := &CheckStatus{check, strconv.Itoa(resp.StatusCode), responseTime}
 		codes <- httpStatus
 		defer resp.Body.Close()
 	} else {
 		end := time.Now()
 		responseTime := end.Sub(start)
-		httpStatus := &CheckStatus{err.Error(), responseTime}
+		httpStatus := &CheckStatus{check, err.Error(), responseTime}
 		codes <- httpStatus
 	}
 
